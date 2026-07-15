@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -86,10 +87,13 @@ def create_app(
 def _register_routes(application: FastAPI) -> None:
     @application.get("/health")
     async def health(request: Request) -> dict:
+        settings: Settings = request.app.state.settings
         return {
             "status": "ok",
             "service": "oplab-api",
-            "model_enabled": bool(request.app.state.settings.openai_api_key),
+            "model_enabled": bool(settings.openai_api_key),
+            "model": settings.openai_model,
+            "model_endpoint": urlsplit(settings.openai_base_url).netloc,
         }
 
     @application.get("/api/projects")

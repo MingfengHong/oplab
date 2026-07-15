@@ -9,7 +9,10 @@ from tests.fixtures import EmptySearch, StubSearch
 def test_api_creates_project_and_pauses_for_meeting(settings):
     app = create_app(settings, search_adapter=StubSearch())
     with TestClient(app) as client:
-        assert client.get("/health").json()["status"] == "ok"
+        health = client.get("/health").json()
+        assert health["status"] == "ok"
+        assert health["model"] == settings.openai_model
+        assert health["model_endpoint"] == "api.openai.com"
         created = client.post(
             "/api/projects",
             json={

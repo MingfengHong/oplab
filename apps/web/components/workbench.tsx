@@ -68,6 +68,13 @@ type ProjectSummary = {
   latest_run?: Run | null;
 };
 
+type Health = {
+  status: string;
+  model_enabled: boolean;
+  model: string;
+  model_endpoint: string;
+};
+
 type Dashboard = {
   project: { id: string; title: string; status: string; stage: string; created_at: string };
   question: { text: string; success_criteria: string[] };
@@ -151,6 +158,7 @@ export function Workbench() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [selected, setSelected] = useState<string>("");
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
+  const [health, setHealth] = useState<Health | null>(null);
   const [activeTab, setActiveTab] = useState<Tab>("cockpit");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>("");
@@ -168,6 +176,14 @@ export function Workbench() {
     }
   }, [selected]);
 
+  const loadHealth = useCallback(async () => {
+    try {
+      setHealth(await requestJson<Health>("/health"));
+    } catch {
+      setHealth(null);
+    }
+  }, []);
+
   const loadDashboard = useCallback(async (projectId: string) => {
     if (!projectId) return;
     try {
@@ -181,7 +197,8 @@ export function Workbench() {
 
   useEffect(() => {
     void loadProjects();
-  }, [loadProjects]);
+    void loadHealth();
+  }, [loadProjects, loadHealth]);
 
   useEffect(() => {
     void loadDashboard(selected);
@@ -347,7 +364,7 @@ export function Workbench() {
               <p className="date-line">{dateLabel}</p>
             </div>
             <div className="header-actions">
-              <span className="live-pill"><i /> {currentRun?.status === "running" ? "Agent 运行中" : "系统就绪"}</span>
+              <span className="live-pill"><i /> {currentRun?.status === "running" ? "Harness 运行中" : health?.model_enabled ? `${health.model} 已连接` : "确定性模式"}</span>
               <select value={selected} onChange={(event) => setSelected(event.target.value)} aria-label="选择课题">
                 {projects.map((project) => <option key={project.id} value={project.id}>{project.title}</option>)}
               </select>
@@ -368,7 +385,7 @@ export function Workbench() {
           ) : activeTab === "artifacts" ? (
             <Artifacts dashboard={dashboard} />
           ) : (
-            <SettingsPanel />
+            <SettingsPanel health={health} />
           )}
         </div>
       </section>
@@ -494,8 +511,8 @@ function Artifacts({ dashboard }: { dashboard: Dashboard | null }) {
   return <div className="panel artifact-panel"><PanelHeader title="研究产物" subtitle="每个产物绑定 run、trace、来源与内容哈希" badge={`${dashboard.artifacts.length} files`} /><div className="artifact-grid">{dashboard.artifacts.map((artifact) => <a key={artifact.id} href={`${API}/api/artifacts/${artifact.id}`} target="_blank" rel="noreferrer" className="artifact-card"><span>MD</span><div><b>{artifact.title}</b><small>{new Date(artifact.created_at).toLocaleString("zh-CN")}</small><code>{artifact.content_hash.slice(0, 16)}</code></div><em>↗</em></a>)}{!dashboard.artifacts.length && <div className="quiet-empty">组会批准综合后，Writer 会在这里发布研究备忘录。</div>}</div></div>;
 }
 
-function SettingsPanel() {
-  return <div className="settings-grid"><section className="panel setting-card"><span className="ingest-icon blue">AI</span><div><h3>模型路由</h3><p>未配置密钥时使用确定性路径；配置 OpenAI 兼容端点后启用结构化综合。</p></div><Status value="policy controlled" /></section><section className="panel setting-card"><span className="ingest-icon mint">DB</span><div><h3>状态边界</h3><p>领域状态、LangGraph checkpoint 与 artifact store 相互独立。</p></div><Status value="separated" /></section><section className="panel setting-card"><span className="ingest-icon lavender">ID</span><div><h3>幂等副作用</h3><p>重复执行节点不会创建重复来源、组会或产物。</p></div><Status value="enforced" /></section></div>;
+function SettingsPanel({ health }: { health: Health | null }) {
+  return <div className="settings-grid"><section className="panel setting-card"><span className="ingest-icon blue">AI</span><div><h3>模型路由</h3><p>{health?.model_enabled ? `当前模型 ${health.model}，端点 ${health.model_endpoint}。密钥不会返回前端。` : "当前未启用模型，Harness 使用确定性策略路径。"}</p></div><Status value={health?.model_enabled ? "model connected" : "deterministic"} /></section><section className="panel setting-card"><span className="ingest-icon mint">DB</span><div><h3>状态边界</h3><p>领域状态、LangGraph checkpoint 与 artifact store 相互独立。</p></div><Status value="separated" /></section><section className="panel setting-card"><span className="ingest-icon lavender">ID</span><div><h3>幂等副作用</h3><p>重复执行节点不会创建重复来源、组会或产物。</p></div><Status value="enforced" /></section></div>;
 }
 
 function PanelHeader({ title, subtitle, badge }: { title: string; subtitle: string; badge?: string }) {
