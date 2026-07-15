@@ -119,20 +119,24 @@ class ResearchWorkflow:
                 "Search explicitly for counterevidence",
             ],
             "search_query": state["question"],
+            "search_queries": [state["question"]],
         }
         try:
-            charter = await self.model.complete_json(
+            charter_payload = await self.model.complete_json(
                 system=(
                     "You are the research director. Return a compact JSON Research Charter with "
                     "research_question, scope, success_criteria, exclusions, "
-                    "evidence_requirements, "
-                    "and search_query. Do not invent findings."
+                    "evidence_requirements, and search_queries. success_criteria, exclusions, and "
+                    "evidence_requirements must be JSON arrays of strings. search_queries must be "
+                    "three concise English academic keyword queries as a JSON array. Do not use "
+                    "quotes or Boolean operators such as AND/OR. Do not invent findings."
                 ),
                 prompt=state["question"],
                 fallback=fallback,
             )
         except ModelUnavailableError:
-            charter = fallback
+            charter_payload = fallback
+        charter = _normalize_charter(charter_payload, fallback)
         digest = hashlib.sha256(json.dumps(charter, sort_keys=True).encode()).hexdigest()
         for owner, title, objective in (
             ("librarian", "Build the evidence ledger", "Find and bind passages to source records"),
@@ -158,10 +162,39 @@ class ResearchWorkflow:
 
     async def _librarian(self, state: ResearchState) -> dict:
         generation = state.get("generation", 0)
-        query = state.get("charter", {}).get("search_query", state["question"])
+        charter = state.get("charter", {})
+        queries = charter.get("search_queries") or [
+            charter.get("search_query", state["question"])
+        ]
+        queries = [_normalize_search_query(str(query)) for query in queries]
+        queries = [query for query in dict.fromkeys(queries) if query]
         if state.get("revision_direction"):
-            query = f"{query} {state['revision_direction']}"
-        candidates = await self.search.search(query, self.settings.retrieval_limit)
+            queries = [
+                _normalize_search_query(f"{query} {state['revision_direction']}")
+                for query in queries
+            ]
+        candidates = []
+        seen_candidates = set()
+        per_query = max(2, (self.settings.retrieval_limit + len(queries) - 1) // len(queries))
+        for query in queries:
+            for candidate in await self.search.search(query, per_query):
+                key = candidate.doi or candidate.uri or candidate.title.casefold()
+                if key in seen_candidates:
+                    continue
+                seen_candidates.add(key)
+                candidates.append(candidate)
+                if len(candidates) >= self.settings.retrieval_limit:
+                    break
+            if len(candidates) >= self.settings.retrieval_limit:
+                break
+        if not candidates:
+            fallback_query = _normalize_search_query(
+                str(charter.get("research_question") or state["question"])
+            )
+            if fallback_query and fallback_query not in queries:
+                candidates = await self.search.search(
+                    fallback_query, self.settings.retrieval_limit
+                )
         source_ids = list(state.get("source_ids", []))
         claim_ids = list(state.get("claim_ids", []))
         for candidate in candidates:
@@ -222,7 +255,10 @@ class ResearchWorkflow:
 
     async def _skeptic(self, state: ResearchState) -> dict:
         generation = state.get("generation", 0)
-        query = f"{state['question']} limitations contradictory evidence null results"
+        base_query = state.get("charter", {}).get("search_query", state["question"])
+        query = _normalize_search_query(
+            f"{base_query} limitations contradictory evidence null results"
+        )
         candidates = await self.search.search(query, max(3, self.settings.retrieval_limit // 2))
         opposing_passages = []
         source_ids = list(state.get("source_ids", []))
@@ -376,6 +412,11 @@ class ResearchWorkflow:
 
     async def _writer(self, state: ResearchState) -> dict:
         bundle = await self.domain.evidence_bundle(state["project_id"])
+        if not bundle["sources"] or not bundle["claims"]:
+            raise RuntimeError(
+                "Evidence gate denied synthesis: at least one source and one "
+                "bound claim are required"
+            )
         source_labels = {
             source["id"]: f"S{index}" for index, source in enumerate(bundle["sources"], 1)
         }
@@ -590,6 +631,69 @@ class RunManager:
 
 def _json_state(state: dict) -> dict:
     return json.loads(json.dumps(state, default=str))
+
+
+def _normalize_charter(payload: Any, fallback: dict[str, Any]) -> dict[str, Any]:
+    """Keep provider formatting differences from breaking the research run."""
+    values = payload if isinstance(payload, dict) else {}
+    raw_queries = values.get("search_queries") or values.get("search_query")
+    fallback_queries = fallback.get("search_queries") or [fallback["search_query"]]
+    search_queries = [
+        query
+        for query in (
+            _normalize_search_query(item)
+            for item in _as_text_list(raw_queries, fallback_queries)
+        )
+        if query
+    ][:4]
+    if not search_queries:
+        search_queries = [_normalize_search_query(fallback["search_query"])]
+    return {
+        "research_question": _as_text(
+            values.get("research_question"), fallback["research_question"]
+        ),
+        "scope": _as_text(values.get("scope"), fallback["scope"]),
+        "success_criteria": _as_text_list(
+            values.get("success_criteria"), fallback["success_criteria"]
+        ),
+        "exclusions": _as_text_list(values.get("exclusions"), fallback["exclusions"]),
+        "evidence_requirements": _as_text_list(
+            values.get("evidence_requirements"), fallback["evidence_requirements"]
+        ),
+        "search_query": search_queries[0],
+        "search_queries": search_queries,
+    }
+
+
+def _as_text(value: Any, fallback: str) -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, list):
+        joined = " ".join(str(item).strip() for item in value if str(item).strip())
+        if joined:
+            return joined
+    return fallback
+
+
+def _as_text_list(value: Any, fallback: list[str]) -> list[str]:
+    if isinstance(value, str):
+        candidates = re.split(r"(?:\r?\n|[;；])", value)
+    elif isinstance(value, list):
+        candidates = value
+    else:
+        return list(fallback)
+    items = []
+    for candidate in candidates:
+        text = re.sub(r"^\s*(?:[-*•]|\d+[.)、])\s*", "", str(candidate)).strip()
+        if text:
+            items.append(text)
+    return items or list(fallback)
+
+
+def _normalize_search_query(value: str) -> str:
+    text = re.sub(r'["“”‘’()]', " ", value)
+    text = re.sub(r"\b(?:AND|OR|NOT)\b", " ", text, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _citations_are_valid(text: str, allowed: set[str]) -> bool:

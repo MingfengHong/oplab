@@ -3,7 +3,7 @@ import time
 from fastapi.testclient import TestClient
 from oplab_api.main import create_app
 
-from tests.fixtures import StubSearch
+from tests.fixtures import EmptySearch, StubSearch
 
 
 def test_api_creates_project_and_pauses_for_meeting(settings):
@@ -46,3 +46,32 @@ def test_api_creates_project_and_pauses_for_meeting(settings):
         report = client.get(f"/api/artifacts/{run['report_artifact_id']}")
         assert report.status_code == 200
         assert "[S1]" in report.text
+
+
+def test_api_rejects_synthesis_without_evidence(settings):
+    app = create_app(settings, search_adapter=EmptySearch())
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/projects",
+            json={
+                "title": "Empty retrieval",
+                "question": "Can a research run publish when no evidence was retrieved?",
+                "success_criteria": ["Do not publish empty synthesis"],
+            },
+        )
+        project_id = created.json()["id"]
+        run_id = client.post(f"/api/projects/{project_id}/runs").json()["id"]
+        run = {}
+        for _ in range(80):
+            run = client.get(f"/api/runs/{run_id}").json()
+            if run["status"] in {"needs_user", "failed"}:
+                break
+            time.sleep(0.05)
+        assert run["status"] == "needs_user", run.get("error")
+
+        decision = client.post(
+            f"/api/runs/{run_id}/decision",
+            json={"kind": "continue", "rationale": "Try to publish anyway."},
+        )
+        assert decision.status_code == 409
+        assert "without at least one source" in decision.json()["detail"]

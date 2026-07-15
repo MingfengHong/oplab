@@ -202,6 +202,18 @@ def _register_routes(application: FastAPI) -> None:
             meeting = run.get("meeting")
             if not meeting:
                 raise HTTPException(status_code=409, detail="Run has no pending meeting")
+            packet = meeting.get("evidence_packet") or {}
+            if payload.kind == MeetingDecisionKind.CONTINUE.value and (
+                int(packet.get("source_count", 0)) < 1
+                or int(packet.get("claim_count", 0)) < 1
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Cannot continue to synthesis without at least one source "
+                        "and one evidence-bound claim"
+                    ),
+                )
             decision_data = payload.model_dump()
             digest = hashlib.sha256(
                 json.dumps(decision_data, sort_keys=True).encode("utf-8")

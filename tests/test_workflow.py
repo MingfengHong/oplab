@@ -12,6 +12,65 @@ from oplab.harness.model import ModelGateway
 from tests.fixtures import StubSearch
 
 
+class ProviderShapedModel:
+    enabled = True
+
+    async def complete_json(self, **_kwargs):
+        return {
+            "research_question": "How do communities recover from maintainer loss?",
+            "scope": "Open-source governance resilience",
+            "success_criteria": "Identify recovery mechanisms; retain opposing evidence",
+            "exclusions": "No unsupported causal claims",
+            "evidence_requirements": (
+                "Longitudinal studies; case evidence from open-source communities"
+            ),
+            "search_query": (
+                '"open source community" AND "maintainer loss" AND resilience governance'
+            ),
+        }
+
+    async def complete_text(self, *, fallback, **_kwargs):
+        return fallback
+
+
+@pytest.mark.asyncio
+async def test_workflow_normalizes_provider_charter_and_reaches_meeting(settings, services):
+    _, domain, queries = services
+    project = await domain.create_project(
+        title="Provider-shaped charter",
+        question="How do open-source communities recover after maintainer loss?",
+        success_criteria=[],
+    )
+    run = await domain.start_run(project.id)
+    workflow = ResearchWorkflow(
+        settings=settings,
+        domain=domain,
+        search=StubSearch(),
+        model=ProviderShapedModel(),
+    )
+    await workflow.start()
+    manager = RunManager(workflow, domain)
+    await manager.enqueue(run.id)
+    await manager.wait(run.id)
+
+    waiting = await queries.run(run.id)
+    assert waiting["status"] == "needs_user", waiting["error"]
+    assert waiting["current_phase"] == "meeting"
+    assert waiting["state"]["charter"]["search_query"] == (
+        "open source community maintainer loss resilience governance"
+    )
+    assert waiting["state"]["charter"]["success_criteria"] == [
+        "Identify recovery mechanisms",
+        "retain opposing evidence",
+    ]
+    evidence = await queries.evidence(project.id)
+    assert len(evidence["sources"]) == 2
+    assert len(evidence["claims"]) == 1
+
+    await manager.close()
+    await workflow.close()
+
+
 @pytest.mark.asyncio
 async def test_workflow_survives_runtime_restart_and_publishes_cited_memo(settings, services):
     _, domain, queries = services

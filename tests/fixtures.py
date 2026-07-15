@@ -53,3 +53,8 @@ class StubSearch:
                 quality={"provider": "test", "primary_source": True},
             )
         ]
+
+
+class EmptySearch:
+    async def search(self, query: str, limit: int) -> list[SourceCandidate]:
+        return []
