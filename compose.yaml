@@ -1,0 +1,57 @@
+name: oplab
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: oplab
+      POSTGRES_USER: oplab
+      POSTGRES_PASSWORD: oplab
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U oplab -d oplab"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://oplab:oplab@postgres:5432/oplab
+      CHECKPOINT_DATABASE_URL: /data/checkpoints.sqlite
+      API_CORS_ORIGINS: http://localhost:3000
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5-mini}
+      OPENALEX_MAILTO: ${OPENALEX_MAILTO:-}
+      OPLAB_ARTIFACT_ROOT: /data/artifacts
+      OPLAB_UPLOAD_ROOT: /data/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      - oplab_data:/data
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    depends_on:
+      - api
+    ports:
+      - "3000:3000"
+
+volumes:
+  postgres_data:
+  oplab_data:

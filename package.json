@@ -1,0 +1,11 @@
+{
+  "name": "oplab",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm --filter @oplab/web dev",
+    "build": "pnpm --filter @oplab/web build",
+    "lint": "pnpm --filter @oplab/web lint",
+    "typecheck": "pnpm --filter @oplab/web typecheck"
+  },
+  "packageManager": "pnpm@11.7.0"
+}

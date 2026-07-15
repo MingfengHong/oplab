@@ -1,0 +1,1 @@
+"""Oplab FastAPI service."""
