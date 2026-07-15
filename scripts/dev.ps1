@@ -14,7 +14,12 @@ if (-not $NoInstall) {
 }
 
 Write-Host "Starting API at http://localhost:8000 and workbench at http://localhost:3000"
-$api = Start-Process -FilePath "uv" -ArgumentList @("run", "uvicorn", "oplab_api.main:app", "--reload", "--port", "8000") -PassThru -NoNewWindow
+$python = Join-Path $Root ".venv\Scripts\python.exe"
+$apiArguments = @(
+    "-m", "dotenv", "-f", ".env", "run", "--override", "--",
+    $python, "-m", "uvicorn", "oplab_api.main:app", "--reload", "--port", "8000"
+)
+$api = Start-Process -FilePath $python -ArgumentList $apiArguments -PassThru -NoNewWindow
 try {
     pnpm.cmd --filter @oplab/web dev
 }
