@@ -43,10 +43,8 @@ services:
     build:
       context: .
       dockerfile: apps/web/Dockerfile
-      args:
-        NEXT_PUBLIC_API_URL: http://localhost:8000
     environment:
-      NEXT_PUBLIC_API_URL: http://localhost:8000
+      OPLAB_API_INTERNAL_URL: http://api:8000
     depends_on:
       - api
     ports:

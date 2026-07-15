@@ -204,8 +204,7 @@ def _register_routes(application: FastAPI) -> None:
                 raise HTTPException(status_code=409, detail="Run has no pending meeting")
             packet = meeting.get("evidence_packet") or {}
             if payload.kind == MeetingDecisionKind.CONTINUE.value and (
-                int(packet.get("source_count", 0)) < 1
-                or int(packet.get("claim_count", 0)) < 1
+                int(packet.get("source_count", 0)) < 1 or int(packet.get("claim_count", 0)) < 1
             ):
                 raise HTTPException(
                     status_code=409,

@@ -2,7 +2,38 @@
 
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 
-const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+const API = "";
+
+type HarnessState = {
+  plan?: {
+    objectives?: Array<{
+      id: string;
+      title: string;
+      kind: string;
+      status: string;
+    }>;
+  };
+  budget?: Record<string, number>;
+  usage?: Record<string, number>;
+  evaluation?: {
+    ready_for_review: boolean;
+    coverage_score: number;
+    gaps: string[];
+    next_recommendation: string;
+  };
+  trajectory?: Array<{
+    kind: string;
+    action?: string;
+    status?: string;
+    summary?: string;
+    rationale?: string;
+    query?: string | null;
+    decision_source?: string;
+    iteration?: number;
+  }>;
+  controller_source?: string;
+  review?: { decision?: string; summary?: string };
+};
 
 type Run = {
   id: string;
@@ -12,6 +43,7 @@ type Run = {
   error?: string | null;
   report_artifact_id?: string | null;
   meeting?: Meeting | null;
+  state?: HarnessState;
   updated_at: string;
 };
 
@@ -84,6 +116,12 @@ const nav: Array<{ id: Tab; label: string; icon: string }> = [
 ];
 
 const phaseLabels: Record<string, string> = {
+  plan: "动态规划",
+  decide: "控制器决策",
+  execute: "工具执行",
+  evaluate: "证据评估",
+  review: "独立审稿",
+  publish: "发布产物",
   charter: "研究章程",
   librarian: "文献检索",
   skeptic: "反证审查",
@@ -93,10 +131,18 @@ const phaseLabels: Record<string, string> = {
 };
 
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API}${path}`, init);
+  let response: Response;
+  try {
+    response = await fetch(`${API}${path}`, init);
+  } catch {
+    throw new Error("API 服务没有响应。请确认本地 8000 端口已启动后重试。");
+  }
   if (!response.ok) {
     const payload = await response.json().catch(() => ({ detail: response.statusText }));
-    throw new Error(payload.detail ?? "请求失败");
+    if ([502, 503, 504].includes(response.status)) {
+      throw new Error("API 服务尚未就绪。前端正常，但 8000 端口的后端不可用。");
+    }
+    throw new Error(payload.detail ?? `请求失败（HTTP ${response.status}）`);
   }
   return response.json() as Promise<T>;
 }
@@ -288,7 +334,7 @@ export function Workbench() {
           <div className="sidebar-project">
             <div className="project-orb">研</div>
             <strong>{dashboard?.project.title ?? "尚未创建课题"}</strong>
-            <span>{dashboard ? "Phase A · Evidence loop" : "Research OS"}</span>
+            <span>{dashboard ? "Dynamic Harness · Evidence loop" : "Research OS"}</span>
           </div>
           <button className="ghost-action" onClick={() => setShowCreate(true)}>＋ 新建课题</button>
         </aside>
@@ -309,7 +355,7 @@ export function Workbench() {
             </div>
           </header>
 
-          {error && <div className="error-banner"><span>!</span>{error}<button onClick={() => setError("")}>×</button></div>}
+          {error && <div className="error-banner"><span>!</span>{error}<button onClick={() => { setError(""); void loadProjects(); void loadDashboard(selected); }}>重试</button></div>}
 
           {!dashboard && !showCreate ? (
             <div className="empty-state"><div className="loader" /><p>正在连接研究工作台…</p></div>
@@ -365,8 +411,8 @@ function Cockpit({ dashboard, run, meeting, busy, onStart }: { dashboard: Dashbo
 
       <section className="dashboard-grid">
         <div className="panel pipeline-panel">
-          <PanelHeader title="科研闭环" subtitle="每一步都有明确状态与停止条件" badge={run?.status ?? "not started"} />
-          <Pipeline phase={run?.current_phase ?? "charter"} status={run?.status} />
+          <PanelHeader title="Harness 决策闭环" subtitle="模型选择工具，策略层校验并持久化每一步" badge={run?.state?.controller_source ?? run?.status ?? "not started"} />
+          <HarnessLoop run={run} />
           <div className="question-card">
             <span>核心研究问题</span>
             <p>{dashboard.question.text}</p>
@@ -403,10 +449,34 @@ function MetricCard({ tone, label, value, detail, icon }: { tone: string; label:
   return <div className={`metric-card ${tone}`}><div><span className="metric-icon">{icon}</span><span>{label}</span></div><strong>{value.toString().padStart(2, "0")}</strong><p>{detail}</p></div>;
 }
 
-function Pipeline({ phase, status }: { phase: string; status?: string }) {
-  const phases = ["charter", "librarian", "skeptic", "meeting", "writer", "complete"];
-  const current = phases.indexOf(phase);
-  return <div className="pipeline">{phases.map((item, index) => <div key={item} className={index < current || status === "completed" ? "pipeline-step done" : index === current ? "pipeline-step current" : "pipeline-step"}><span>{index < current || status === "completed" ? "✓" : index + 1}</span><small>{phaseLabels[item]}</small></div>)}</div>;
+function HarnessLoop({ run }: { run?: Run }) {
+  const state = run?.state;
+  const usage = state?.usage ?? {};
+  const budget = state?.budget ?? {};
+  const evaluation = state?.evaluation;
+  const objectives = state?.plan?.objectives ?? [];
+  const trace = (state?.trajectory ?? []).filter((item) => item.kind !== "evaluation").slice(-5).reverse();
+  if (!run) return <div className="quiet-empty harness-empty">启动研究后，控制器会根据证据缺口动态选择工具。</div>;
+  return <div className="harness-console">
+    <div className="harness-stats">
+      <div><span>当前状态</span><b>{phaseLabels[run.current_phase] ?? run.current_phase}</b></div>
+      <div><span>覆盖评分</span><b>{Math.round((evaluation?.coverage_score ?? 0) * 100)}%</b></div>
+      <div><span>迭代预算</span><b>{usage.iterations ?? 0} / {budget.max_iterations ?? "–"}</b></div>
+      <div><span>检索预算</span><b>{usage.searches ?? 0} / {budget.max_searches ?? "–"}</b></div>
+    </div>
+    <div className="objective-strip">
+      {objectives.map((objective) => <div key={objective.id} className={`objective-chip objective-${objective.status}`}><i /> <span>{objective.title}</span><small>{objective.status.replaceAll("_", " ")}</small></div>)}
+    </div>
+    {evaluation?.gaps?.length ? <div className="gap-note"><b>当前证据缺口</b><span>{evaluation.gaps.join(" · ")}</span></div> : evaluation ? <div className="gap-note ready"><b>证据门禁</b><span>已满足，等待人工审查或发布门禁。</span></div> : null}
+    <div className="trace-list">
+      {trace.map((item, index) => <div className="trace-row" key={`${item.kind}-${item.iteration}-${index}`}>
+        <span className={item.kind === "decision" ? "trace-icon decision" : "trace-icon result"}>{item.kind === "decision" ? "D" : "T"}</span>
+        <p><b>{item.action?.replaceAll("_", " ") ?? item.kind}</b><small>{item.summary ?? item.rationale ?? item.query ?? "已记录"}</small></p>
+        <em>{item.decision_source ?? item.status ?? `#${item.iteration ?? "–"}`}</em>
+      </div>)}
+      {!trace.length && <div className="quiet-empty harness-empty">正在建立研究计划…</div>}
+    </div>
+  </div>;
 }
 
 function EvidenceWorkspace({ dashboard, busy, onUpload, onAddUrl }: { dashboard: Dashboard | null; busy: boolean; onUpload: (event: FormEvent<HTMLFormElement>) => void; onAddUrl: (event: FormEvent<HTMLFormElement>) => void }) {

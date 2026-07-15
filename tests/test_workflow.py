@@ -34,7 +34,7 @@ class ProviderShapedModel:
 
 
 @pytest.mark.asyncio
-async def test_workflow_normalizes_provider_charter_and_reaches_meeting(settings, services):
+async def test_dynamic_harness_reaches_meeting_with_auditable_trajectory(settings, services):
     _, domain, queries = services
     project = await domain.create_project(
         title="Provider-shaped charter",
@@ -56,13 +56,22 @@ async def test_workflow_normalizes_provider_charter_and_reaches_meeting(settings
     waiting = await queries.run(run.id)
     assert waiting["status"] == "needs_user", waiting["error"]
     assert waiting["current_phase"] == "meeting"
-    assert waiting["state"]["charter"]["search_query"] == (
-        "open source community maintainer loss resilience governance"
-    )
-    assert waiting["state"]["charter"]["success_criteria"] == [
-        "Identify recovery mechanisms",
-        "retain opposing evidence",
-    ]
+    state = waiting["state"]
+    assert {item["kind"] for item in state["plan"]["objectives"]} == {
+        "discover",
+        "extract",
+        "challenge",
+        "synthesize",
+    }
+    decisions = [item for item in state["trajectory"] if item["kind"] == "decision"]
+    assert {item["action"] for item in decisions} >= {
+        "search_literature",
+        "extract_claims",
+        "challenge_claims",
+        "request_user",
+    }
+    assert any(item["kind"] == "evaluation" for item in state["trajectory"])
+    assert state["usage"]["searches"] == settings.harness_max_searches
     evidence = await queries.evidence(project.id)
     assert len(evidence["sources"]) == 2
     assert len(evidence["claims"]) == 1

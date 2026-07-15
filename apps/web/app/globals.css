@@ -112,14 +112,16 @@ a { color: inherit; text-decoration: none; }
 .panel-header p { margin: 5px 0 0; color: var(--muted); font-size: 10px; }
 .panel-header > span { border-radius: 8px; padding: 7px 10px; background: #f1f5f3; color: #67716e; font-size: 9px; text-transform: uppercase; letter-spacing: .06em; }
 
-.pipeline { display: flex; justify-content: space-between; position: relative; padding: 13px 5px 23px; }
-.pipeline::before { content: ""; height: 2px; background: #e8edeb; position: absolute; left: 7%; right: 7%; top: 27px; }
-.pipeline-step { display: grid; place-items: center; gap: 8px; position: relative; z-index: 1; width: 16.66%; color: #98a19f; }
-.pipeline-step span { width: 29px; height: 29px; display: grid; place-items: center; border-radius: 50%; background: #eef2f1; border: 5px solid white; box-sizing: content-box; font-size: 10px; font-weight: 800; }
-.pipeline-step small { font-size: 9px; white-space: nowrap; }
-.pipeline-step.done span { background: #9fddb9; color: #16452b; }
-.pipeline-step.current span { background: var(--lime); color: #233000; box-shadow: 0 0 0 5px rgba(201,243,91,.22); }
-.pipeline-step.current small { color: #212624; font-weight: 800; }
+.harness-console { display: grid; gap: 13px; }
+.harness-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.harness-stats > div { border-radius: 12px; background: #f5f8f7; padding: 11px; display: grid; gap: 5px; }
+.harness-stats span { color: #828c89; font-size: 8px; }.harness-stats b { font-size: 12px; }
+.objective-strip { display: flex; gap: 7px; overflow-x: auto; padding-bottom: 2px; }
+.objective-chip { min-width: 118px; border-radius: 11px; padding: 9px 10px; background: #f4f6f5; display: grid; grid-template-columns: 8px 1fr; gap: 3px 7px; align-items: center; }
+.objective-chip i { width: 7px; height: 7px; border-radius: 50%; background: #c8cfcd; }.objective-chip span { font-size: 9px; font-weight: 750; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }.objective-chip small { grid-column: 2; color: #8a9491; font-size: 7px; text-transform: uppercase; }
+.objective-done { background: #e7f7ee; }.objective-done i { background: #62c48e; }.objective-in_progress { background: #fff2d2; }.objective-in_progress i { background: #e0ac32; }
+.gap-note { border-radius: 11px; padding: 9px 11px; background: #fff3d9; display: grid; grid-template-columns: 95px 1fr; gap: 8px; font-size: 8px; line-height: 1.5; color: #705b2d; }.gap-note.ready { background: #e5f7ed; color: #356b4d; }
+.trace-list { display: grid; gap: 6px; }.trace-row { min-height: 40px; border-top: 1px solid #edf1ef; padding-top: 7px; display: grid; grid-template-columns: 29px 1fr auto; align-items: center; gap: 8px; }.trace-icon { width: 27px; height: 27px; border-radius: 9px; display: grid; place-items: center; font-size: 8px; font-weight: 900; }.trace-icon.decision { background: #e2dcff; color: #5e4c9a; }.trace-icon.result { background: #daf4e6; color: #377356; }.trace-row p { display: grid; gap: 3px; margin: 0; min-width: 0; }.trace-row b { font-size: 9px; text-transform: capitalize; }.trace-row small { color: #7d8784; font-size: 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }.trace-row em { font-style: normal; border-radius: 7px; padding: 4px 6px; background: #f1f4f3; color: #77817e; font-size: 7px; }.harness-empty { min-height: 80px; }
 .question-card { background: #f5f8f7; border-radius: 14px; padding: 16px 18px; display: grid; grid-template-columns: 110px 1fr; gap: 15px; }
 .question-card span { font-size: 10px; color: #7a8582; }
 .question-card p { margin: 0; font-size: 12px; line-height: 1.6; }
@@ -230,6 +232,6 @@ a { color: inherit; text-decoration: none; }
   .header-actions { width: 100%; }.header-actions select { max-width: none; width: 100%; }
   .topbar { display: grid; }.profile-chip { display: none; }
   .ingest-card { grid-template-columns: 48px 1fr; }.ingest-card input, .ingest-card .button { grid-column: 1 / 3; grid-row: auto; }
-  .pipeline { overflow-x: auto; justify-content: flex-start; }.pipeline::before { display: none; }.pipeline-step { min-width: 75px; }
+  .harness-stats { grid-template-columns: 1fr 1fr; }
   .question-card { grid-template-columns: 1fr; }
 }

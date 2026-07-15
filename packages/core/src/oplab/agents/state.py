@@ -18,3 +18,16 @@ class ResearchState(TypedDict, total=False):
     decision: dict[str, Any]
     report_artifact_id: str
     stop_reason: str
+    plan: dict[str, Any]
+    budget: dict[str, int]
+    usage: dict[str, int]
+    quality_gate: dict[str, Any]
+    source_intents: dict[str, str]
+    processed_source_ids: list[str]
+    challenged_source_ids: list[str]
+    evaluation: dict[str, Any]
+    pending_action: dict[str, Any]
+    trajectory: list[dict[str, Any]]
+    draft: str
+    review: dict[str, Any]
+    controller_source: str

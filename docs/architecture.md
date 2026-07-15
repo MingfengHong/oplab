@@ -1,15 +1,19 @@
 # Architecture
 
-## Phase A vertical slice
+## Dynamic research harness
 
 ```text
 Next.js workbench
-       │ HTTP + SSE
+       │ same-origin HTTP proxy + SSE
 FastAPI domain API ── command bus ── SQLAlchemy domain store + append-only events
        │
-LangGraph research graph ── independent SQLite checkpointer
+LangGraph durable shell ── independent SQLite checkpointer
        │
-PI ── Librarian/OpenAlex ── Skeptic ── human meeting interrupt ── Writer
+plan → controller → typed tool → evaluator ─┐
+          ▲                                │
+          └──────── evidence gaps ─────────┘
+          │
+human meeting interrupt → draft → independent reviewer → publish
        │
 upload/artifact store
 ```
@@ -38,17 +42,30 @@ left in `running`; a `needs_user` run remains paused until a meeting decision re
 LangGraph thread. Artifacts are written atomically and registered only after the final path is
 available.
 
-## Harness boundary
+## Harness runtime
 
-`oplab.harness` exposes model, tool, checkpoint, budget, and policy ports. The included local
-implementation is sufficient for phase A. A DeerFlow adapter may implement those ports without
-allowing DeerFlow thread/session types to enter `oplab.domain`. Upstream DeerFlow remains an
-independent MIT-licensed project; Multica code is not used.
+`oplab.harness` is a real decision runtime rather than a role pipeline:
+
+- `schemas.py` defines plans, actions, tool outcomes, evidence evaluations, claim extraction,
+  challenge links, and review verdicts.
+- `controller.py` asks the configured model for exactly one typed decision, then validates tool
+  arguments and policy gates. Malformed structured output is repaired through schema-guided retry.
+- `tools.py` is the permissioned registry. Search is read-only; all evidence, claim, challenge,
+  meeting, and artifact writes still pass through domain commands.
+- `policy.py` supplies deterministic evaluation, offline fallback decisions, iteration/search/source
+  budgets, and a repeated-action fingerprint guard.
+- LangGraph provides recovery and interrupts only. The research strategy lives in persisted plan,
+  evidence state, controller decisions, and evaluator feedback—not graph node names.
+
+The design was informed by Synthetic Sciences OpenScience at commit
+`e9844a49f1f4d93cbf5f88b8f4880c003adc6e61` (Apache-2.0): especially its dynamic tool loop,
+persisted research state, reviewer/subagent gates, trajectory capture, budgets, and anti-loop
+guards. Oplab is an independent Python implementation under AGPL-3.0-or-later.
 
 ## Deferred by design
 
 - Temporal schedules, signals, and cross-day project workflows (phase B)
-- Durable long-term role memory and unattended meetings (phase B)
+- Durable long-term learned-skill distillation and unattended meetings (phase B)
 - Isolated experiment executor and reproduction runs (phase C)
 - A2A federation and multi-tenant institutional policy (phase D)
 

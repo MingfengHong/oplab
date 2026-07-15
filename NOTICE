@@ -6,3 +6,8 @@ under its respective license. See third_party/THIRD_PARTY_NOTICES.md and the
 dependency lockfiles for source and version information.
 
 No Multica source code or restricted visual assets are included.
+
+The dynamic research-harness design was informed by OpenScience from Synthetic
+Sciences (Apache License 2.0), reviewed at commit
+e9844a49f1f4d93cbf5f88b8f4880c003adc6e61. Oplab contains an independent Python
+implementation; see third_party/THIRD_PARTY_NOTICES.md.

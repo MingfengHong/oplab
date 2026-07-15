@@ -117,7 +117,7 @@ class DomainService:
                 thread_id=f"thread-{uuid4()}",
                 trace_id=f"trace-{uuid4()}",
                 status=RunStatus.PENDING.value,
-                current_phase=ResearchPhase.CHARTER.value,
+                current_phase=ResearchPhase.PLAN.value,
             )
             session.add(run)
             await session.flush()
@@ -131,6 +131,44 @@ class DomainService:
                 )
             )
         return run
+
+    async def record_harness_event(
+        self,
+        *,
+        project_id: str,
+        run_id: str,
+        event_type: str,
+        payload: dict,
+    ) -> None:
+        """Persist decision/tool/evaluation trajectory independently of model chat history."""
+        async with self.sessions.begin() as session:
+            session.add(
+                DomainEvent(
+                    project_id=project_id,
+                    aggregate_type="ResearchRun",
+                    aggregate_id=run_id,
+                    event_type=event_type,
+                    payload=payload,
+                )
+            )
+
+    async def set_task_status(self, task_id: str, status: TaskStatus) -> None:
+        async with self.sessions.begin() as session:
+            task = await session.get(ResearchTask, task_id)
+            if task is None:
+                return
+            if task.status == status.value:
+                return
+            task.status = status.value
+            session.add(
+                DomainEvent(
+                    project_id=task.project_id,
+                    aggregate_type="ResearchTask",
+                    aggregate_id=task.id,
+                    event_type="TaskStatusChanged",
+                    payload={"status": status.value},
+                )
+            )
 
     async def set_run_state(
         self,

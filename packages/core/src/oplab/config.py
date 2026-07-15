@@ -24,6 +24,11 @@ class Settings(BaseSettings):
 
     openalex_mailto: str | None = None
     retrieval_limit: int = Field(default=8, ge=1, le=25)
+    harness_max_iterations: int = Field(default=10, ge=3, le=50)
+    harness_max_searches: int = Field(default=5, ge=1, le=20)
+    harness_max_sources: int = Field(default=24, ge=3, le=100)
+    harness_min_sources: int = Field(default=3, ge=1, le=25)
+    harness_min_claims: int = Field(default=2, ge=1, le=20)
     max_source_bytes: int = Field(default=5_000_000, ge=1_024)
     api_cors_origins: str = "http://localhost:3000"
 

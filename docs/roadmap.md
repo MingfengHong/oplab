@@ -1,20 +1,23 @@
 # Delivery roadmap
 
-## Phase A — minimum research loop (implemented)
+## Phase A — dynamic evidence harness (implemented)
 
-- PI, Librarian, Skeptic, and Writer roles with explicit authority
-- project and research-charter creation
+- typed model-directed controller with deterministic fallback policy
+- dependency-aware research plan and dynamic objectives
+- registered search, claim-extraction, challenge, inspection, review, and publish capabilities
 - OpenAlex, URL, PDF, Markdown, and text ingestion
 - claim–passage–source evidence ledger with opposing links
+- schema validation/retry, bounded budgets, and repeated-action protection
+- persisted decision/tool/evaluation trajectory
 - structured meeting interrupt and user decision
-- cited memo and provenance record
+- independent reviewer gate, cited memo, and provenance record
 - persisted LangGraph thread recovery after service restart
 
 ## Phase B — durable autonomy
 
 - Temporal project workflow, schedules, Signals, Queries, and Updates
 - authority envelopes configurable per project
-- context compiler, memory write gate, deterministic progress fingerprint
+- context compiler, memory write gate, and learned-skill distillation
 - unattended meetings, budgets, bounded continuation, and user pause/cancel
 
 ## Phase C — computation and reproduction

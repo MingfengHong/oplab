@@ -64,6 +64,12 @@ class StopReason(StrEnum):
 
 
 class ResearchPhase(StrEnum):
+    PLAN = "plan"
+    DECIDE = "decide"
+    EXECUTE = "execute"
+    EVALUATE = "evaluate"
+    REVIEW = "review"
+    PUBLISH = "publish"
     CHARTER = "charter"
     LIBRARIAN = "librarian"
     SKEPTIC = "skeptic"

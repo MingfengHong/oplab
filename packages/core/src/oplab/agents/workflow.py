@@ -16,23 +16,27 @@ from langgraph.types import interrupt
 
 from oplab.agents.state import ResearchState
 from oplab.config import Settings
-from oplab.domain.commands import (
-    ContestClaim,
-    CreateTask,
-    ProposeClaim,
-    PublishArtifact,
-    RequestMeeting,
-    make_idempotency_key,
-)
-from oplab.domain.enums import ResearchPhase, RunStatus, StopReason
+from oplab.domain.commands import CreateTask, PublishArtifact, RequestMeeting, make_idempotency_key
+from oplab.domain.enums import ResearchPhase, RunStatus, StopReason, TaskStatus
 from oplab.domain.service import DomainService
-from oplab.evidence.ingestor import EvidenceIngestor
+from oplab.harness.controller import HarnessController
 from oplab.harness.model import ModelGateway, ModelUnavailableError
+from oplab.harness.policy import action_fingerprint, evaluate_state
+from oplab.harness.schemas import HarnessAction
+from oplab.harness.tools import HarnessToolRegistry
 from oplab.retrieval.base import SearchAdapter
-from oplab.retrieval.text import first_substantive_sentence
+
+EXECUTABLE_ACTIONS = {
+    "search_literature",
+    "extract_claims",
+    "challenge_claims",
+    "inspect_evidence",
+}
 
 
 class ResearchWorkflow:
+    """Durable shell around a typed, model-directed research harness loop."""
+
     def __init__(
         self,
         *,
@@ -43,9 +47,14 @@ class ResearchWorkflow:
     ):
         self.settings = settings
         self.domain = domain
-        self.search = search
         self.model = model
-        self.ingestor = EvidenceIngestor(domain)
+        self.controller = HarnessController(model)
+        self.tools = HarnessToolRegistry(
+            domain=domain,
+            search=search,
+            model=model,
+            retrieval_limit=settings.retrieval_limit,
+        )
         self._saver_context: Any = None
         self._saver: AsyncSqliteSaver | None = None
         self.graph: Any = None
@@ -56,22 +65,36 @@ class ResearchWorkflow:
         )
         self._saver = await self._saver_context.__aenter__()
         builder = StateGraph(ResearchState)
-        builder.add_node("charter", self._charter)
-        builder.add_node("librarian", self._librarian)
-        builder.add_node("skeptic", self._skeptic)
+        builder.add_node("bootstrap", self._bootstrap)
+        builder.add_node("controller", self._controller)
+        builder.add_node("tool", self._tool)
+        builder.add_node("evaluator", self._evaluator)
         builder.add_node("meeting", self._meeting)
-        builder.add_node("writer", self._writer)
+        builder.add_node("draft", self._draft)
+        builder.add_node("reviewer", self._reviewer)
+        builder.add_node("publish", self._publish)
         builder.add_node("stop", self._stop)
-        builder.add_edge(START, "charter")
-        builder.add_edge("charter", "librarian")
-        builder.add_edge("librarian", "skeptic")
-        builder.add_edge("skeptic", "meeting")
+        builder.add_edge(START, "bootstrap")
+        builder.add_edge("bootstrap", "controller")
+        builder.add_conditional_edges(
+            "controller",
+            self._route_controller,
+            {"tool": "tool", "meeting": "meeting", "stop": "stop"},
+        )
+        builder.add_edge("tool", "evaluator")
+        builder.add_edge("evaluator", "controller")
         builder.add_conditional_edges(
             "meeting",
-            self._route_after_meeting,
-            {"writer": "writer", "revise": "librarian", "stop": "stop"},
+            self._route_meeting,
+            {"draft": "draft", "controller": "controller", "stop": "stop"},
         )
-        builder.add_edge("writer", END)
+        builder.add_edge("draft", "reviewer")
+        builder.add_conditional_edges(
+            "reviewer",
+            self._route_review,
+            {"publish": "publish", "draft": "draft", "meeting": "meeting"},
+        )
+        builder.add_edge("publish", END)
         builder.add_edge("stop", END)
         self.graph = builder.compile(checkpointer=self._saver)
 
@@ -89,17 +112,32 @@ class ResearchWorkflow:
             trace_id=run.trace_id,
             question=question.text,
             success_criteria=question.success_criteria,
-            current_phase=ResearchPhase.CHARTER.value,
+            current_phase=ResearchPhase.PLAN.value,
             generation=0,
             source_ids=[],
             claim_ids=[],
+            processed_source_ids=[],
+            challenged_source_ids=[],
+            source_intents={},
+            trajectory=[],
+            budget={
+                "max_iterations": self.settings.harness_max_iterations,
+                "max_searches": self.settings.harness_max_searches,
+                "max_sources": self.settings.harness_max_sources,
+            },
+            usage={"iterations": 0, "searches": 0, "review_attempts": 0},
+            quality_gate={
+                "min_sources": self.settings.harness_min_sources,
+                "min_claims": self.settings.harness_min_claims,
+                "require_counter_search": True,
+            },
         )
 
     async def invoke(self, run_id: str, resume: dict | None = None) -> dict:
         if self.graph is None:
             raise RuntimeError("Research workflow has not started")
         run = await self.domain.get_run(run_id)
-        config = {"configurable": {"thread_id": run.thread_id}}
+        config = {"configurable": {"thread_id": run.thread_id}, "recursion_limit": 100}
         if resume is not None:
             return await self.graph.ainvoke(GraphCommand(resume=resume), config=config)
         snapshot = await self.graph.aget_state(config)
@@ -107,231 +145,185 @@ class ResearchWorkflow:
             return await self.graph.ainvoke(None, config=config)
         return await self.graph.ainvoke(await self.initial_state(run_id), config=config)
 
-    async def _charter(self, state: ResearchState) -> dict:
-        fallback = {
-            "research_question": state["question"],
-            "scope": "Phase-A evidence synthesis",
-            "success_criteria": state.get("success_criteria")
-            or ["Identify supported and contested claims", "Preserve source-level citations"],
-            "exclusions": ["No causal claim without an identified design"],
-            "evidence_requirements": [
-                "Prefer primary academic sources",
-                "Search explicitly for counterevidence",
-            ],
-            "search_query": state["question"],
-            "search_queries": [state["question"]],
-        }
-        try:
-            charter_payload = await self.model.complete_json(
-                system=(
-                    "You are the research director. Return a compact JSON Research Charter with "
-                    "research_question, scope, success_criteria, exclusions, "
-                    "evidence_requirements, and search_queries. success_criteria, exclusions, and "
-                    "evidence_requirements must be JSON arrays of strings. search_queries must be "
-                    "three concise English academic keyword queries as a JSON array. Do not use "
-                    "quotes or Boolean operators such as AND/OR. Do not invent findings."
-                ),
-                prompt=state["question"],
-                fallback=fallback,
-            )
-        except ModelUnavailableError:
-            charter_payload = fallback
-        charter = _normalize_charter(charter_payload, fallback)
-        digest = hashlib.sha256(json.dumps(charter, sort_keys=True).encode()).hexdigest()
-        for owner, title, objective in (
-            ("librarian", "Build the evidence ledger", "Find and bind passages to source records"),
-            ("skeptic", "Search for counterevidence", "Challenge early claims independently"),
-        ):
-            await self.domain.execute(
+    async def _bootstrap(self, state: ResearchState) -> dict:
+        plan, source = await self.controller.create_plan(
+            state["question"], state.get("success_criteria", [])
+        )
+        plan_data = plan.model_dump()
+        for objective in plan_data["objectives"]:
+            digest = hashlib.sha256(json.dumps(objective, sort_keys=True).encode()).hexdigest()
+            result = await self.domain.execute(
                 CreateTask(
                     project_id=state["project_id"],
                     idempotency_key=make_idempotency_key(
-                        state["project_id"], state["run_id"], f"CreateTask:{owner}", digest
+                        state["project_id"], state["run_id"], "CreateTask", digest
                     ),
                     actor="pi",
-                    title=title,
-                    objective=objective,
-                    owner=owner,
-                    success_criteria=charter.get("success_criteria", []),
-                    evidence_requirements=charter.get("evidence_requirements", []),
+                    title=objective["title"],
+                    objective=objective["description"],
+                    owner=_owner_for_kind(objective["kind"]),
+                    success_criteria=objective["success_criteria"],
+                    evidence_requirements=plan_data["evidence_requirements"],
                 )
             )
-        update = {"charter": charter, "current_phase": ResearchPhase.LIBRARIAN.value}
-        await self._persist_progress(state, update, ResearchPhase.LIBRARIAN)
-        return update
-
-    async def _librarian(self, state: ResearchState) -> dict:
-        generation = state.get("generation", 0)
-        charter = state.get("charter", {})
-        queries = charter.get("search_queries") or [
-            charter.get("search_query", state["question"])
-        ]
-        queries = [_normalize_search_query(str(query)) for query in queries]
-        queries = [query for query in dict.fromkeys(queries) if query]
-        if state.get("revision_direction"):
-            queries = [
-                _normalize_search_query(f"{query} {state['revision_direction']}")
-                for query in queries
-            ]
-        candidates = []
-        seen_candidates = set()
-        per_query = max(2, (self.settings.retrieval_limit + len(queries) - 1) // len(queries))
-        for query in queries:
-            for candidate in await self.search.search(query, per_query):
-                key = candidate.doi or candidate.uri or candidate.title.casefold()
-                if key in seen_candidates:
-                    continue
-                seen_candidates.add(key)
-                candidates.append(candidate)
-                if len(candidates) >= self.settings.retrieval_limit:
-                    break
-            if len(candidates) >= self.settings.retrieval_limit:
-                break
-        if not candidates:
-            fallback_query = _normalize_search_query(
-                str(charter.get("research_question") or state["question"])
-            )
-            if fallback_query and fallback_query not in queries:
-                candidates = await self.search.search(
-                    fallback_query, self.settings.retrieval_limit
-                )
-        source_ids = list(state.get("source_ids", []))
-        claim_ids = list(state.get("claim_ids", []))
-        for candidate in candidates:
-            result = await self.ingestor.ingest(
-                project_id=state["project_id"],
-                run_id=state["run_id"],
-                actor="librarian",
-                candidate=candidate,
-                generation=generation,
-            )
-            if result.entity_id not in source_ids:
-                source_ids.append(result.entity_id)
-            claim_id = await self._propose_first_claim(state, result.entity_id, generation)
-            if claim_id and claim_id not in claim_ids:
-                claim_ids.append(claim_id)
-        # User-uploaded sources are first-class evidence even if network search returned nothing.
-        for source in await self.domain.list_project_sources(state["project_id"]):
-            if source.id in source_ids:
-                continue
-            source_ids.append(source.id)
-            claim_id = await self._propose_first_claim(state, source.id, generation)
-            if claim_id and claim_id not in claim_ids:
-                claim_ids.append(claim_id)
+            objective["task_id"] = result.entity_id
         update = {
-            "source_ids": source_ids,
-            "claim_ids": claim_ids,
-            "current_phase": ResearchPhase.SKEPTIC.value,
+            "plan": plan_data,
+            "controller_source": source,
+            "current_phase": ResearchPhase.DECIDE.value,
         }
-        await self._persist_progress(state, update, ResearchPhase.SKEPTIC)
+        await self.domain.record_harness_event(
+            project_id=state["project_id"],
+            run_id=state["run_id"],
+            event_type="HarnessPlanCreated",
+            payload={"source": source, "plan": plan_data},
+        )
+        await self._persist_progress(state, update, ResearchPhase.DECIDE)
         return update
 
-    async def _propose_first_claim(
-        self, state: ResearchState, source_id: str, generation: int
-    ) -> str | None:
-        passages = await self.domain.list_passages_for_source(source_id)
-        if not passages:
-            return None
-        passage = passages[0]
-        claim_text = first_substantive_sentence(passage.text)
-        if len(claim_text) < 30:
-            return None
-        digest = hashlib.sha256(f"{source_id}:{passage.id}:{claim_text}".encode()).hexdigest()
-        claim = await self.domain.execute(
-            ProposeClaim(
-                project_id=state["project_id"],
-                idempotency_key=make_idempotency_key(
-                    state["project_id"], state["run_id"], "ProposeClaim", digest, generation
-                ),
-                actor="librarian",
-                canonical_text=claim_text,
-                confidence=0.55,
-                passage_id=passage.id,
-                rationale="The claim is stated in a bound source passage.",
-                strength=0.55,
-            )
+    async def _controller(self, state: ResearchState) -> dict:
+        usage = dict(state.get("usage", {}))
+        usage["iterations"] = int(usage.get("iterations", 0)) + 1
+        state_with_usage = {**state, "usage": usage}
+        evaluation = evaluate_state(
+            state_with_usage, await self.domain.evidence_bundle(state["project_id"])
         )
-        return claim.entity_id
+        if usage["iterations"] > int(state.get("budget", {}).get("max_iterations", 10)):
+            action = HarnessAction(
+                action="request_user",
+                rationale="The autonomous iteration budget has been exhausted.",
+                expected_outcome="User decides whether to revise scope, add evidence, or stop.",
+            )
+            source = "budget_guard"
+        else:
+            action, source = await self.controller.choose_action(state_with_usage, evaluation)
+        action_data = action.model_dump()
+        trace = {
+            "kind": "decision",
+            **action_data,
+            "fingerprint": action_fingerprint(action),
+            "iteration": usage["iterations"],
+            "decision_source": source,
+        }
+        trajectory = [*state.get("trajectory", []), trace]
+        phase = (
+            ResearchPhase.EXECUTE
+            if action.action in EXECUTABLE_ACTIONS
+            else ResearchPhase.MEETING
+            if action.action in {"request_review", "request_user"}
+            else ResearchPhase.COMPLETE
+        )
+        update = {
+            "usage": usage,
+            "evaluation": evaluation.model_dump(),
+            "pending_action": action_data,
+            "controller_source": source,
+            "trajectory": trajectory,
+            "current_phase": phase.value,
+        }
+        await self._set_objective_status(state, action.objective_id, TaskStatus.IN_PROGRESS)
+        await self.domain.record_harness_event(
+            project_id=state["project_id"],
+            run_id=state["run_id"],
+            event_type="HarnessDecisionMade",
+            payload=trace,
+        )
+        await self._persist_progress(state, update, phase)
+        return update
 
-    async def _skeptic(self, state: ResearchState) -> dict:
-        generation = state.get("generation", 0)
-        base_query = state.get("charter", {}).get("search_query", state["question"])
-        query = _normalize_search_query(
-            f"{base_query} limitations contradictory evidence null results"
+    @staticmethod
+    def _route_controller(state: ResearchState) -> Literal["tool", "meeting", "stop"]:
+        action = state.get("pending_action", {}).get("action")
+        if action in EXECUTABLE_ACTIONS:
+            return "tool"
+        if action in {"request_review", "request_user"}:
+            return "meeting"
+        return "stop"
+
+    async def _tool(self, state: ResearchState) -> dict:
+        action = HarnessAction.model_validate(state["pending_action"])
+        values, outcome = await self.tools.execute(state, action)
+        trace = {
+            "kind": "tool_result",
+            **outcome.model_dump(),
+            "intent": action.intent,
+            "fingerprint": action_fingerprint(action),
+            "iteration": state.get("usage", {}).get("iterations", 0),
+        }
+        update = {
+            **values,
+            "trajectory": [*state.get("trajectory", []), trace],
+            "current_phase": ResearchPhase.EVALUATE.value,
+        }
+        await self.domain.record_harness_event(
+            project_id=state["project_id"],
+            run_id=state["run_id"],
+            event_type="HarnessToolCompleted",
+            payload=trace,
         )
-        candidates = await self.search.search(query, max(3, self.settings.retrieval_limit // 2))
-        opposing_passages = []
-        source_ids = list(state.get("source_ids", []))
-        for candidate in candidates:
-            result = await self.ingestor.ingest(
-                project_id=state["project_id"],
-                run_id=state["run_id"],
-                actor="skeptic",
-                candidate=candidate,
-                generation=generation,
-            )
-            if result.entity_id not in source_ids:
-                source_ids.append(result.entity_id)
-            passages = await self.domain.list_passages_for_source(result.entity_id)
-            if passages:
-                opposing_passages.append(passages[0])
-        for index, claim_id in enumerate(state.get("claim_ids", [])):
-            if index >= len(opposing_passages):
-                break
-            passage = opposing_passages[index]
-            digest = hashlib.sha256(f"{claim_id}:{passage.id}".encode()).hexdigest()
-            await self.domain.execute(
-                ContestClaim(
-                    project_id=state["project_id"],
-                    idempotency_key=make_idempotency_key(
-                        state["project_id"], state["run_id"], "ContestClaim", digest, generation
-                    ),
-                    actor="skeptic",
-                    claim_id=claim_id,
-                    passage_id=passage.id,
-                    rationale=(
-                        "The independently retrieved limitations search may constrain or challenge "
-                        "the scope of this claim; human review is required."
-                    ),
-                    strength=0.45,
-                )
-            )
-        update = {"source_ids": source_ids, "current_phase": ResearchPhase.MEETING.value}
-        await self._persist_progress(state, update, ResearchPhase.MEETING)
+        await self._persist_progress(state, update, ResearchPhase.EVALUATE)
+        return update
+
+    async def _evaluator(self, state: ResearchState) -> dict:
+        bundle = await self.domain.evidence_bundle(state["project_id"])
+        evaluation = evaluate_state(state, bundle)
+        plan = _update_plan_progress(state.get("plan", {}), state, evaluation.model_dump())
+        await self._sync_plan_tasks(plan)
+        trace = {
+            "kind": "evaluation",
+            **evaluation.model_dump(),
+            "iteration": state.get("usage", {}).get("iterations", 0),
+        }
+        update = {
+            "evaluation": evaluation.model_dump(),
+            "plan": plan,
+            "trajectory": [*state.get("trajectory", []), trace],
+            "current_phase": ResearchPhase.DECIDE.value,
+        }
+        await self.domain.record_harness_event(
+            project_id=state["project_id"],
+            run_id=state["run_id"],
+            event_type="HarnessEvaluationCompleted",
+            payload=trace,
+        )
+        await self._persist_progress(state, update, ResearchPhase.DECIDE)
         return update
 
     async def _meeting(self, state: ResearchState) -> dict:
-        generation = state.get("generation", 0)
+        generation = int(state.get("generation", 0))
         bundle = await self.domain.evidence_bundle(state["project_id"])
+        evaluation = evaluate_state(state, bundle)
+        action = state.get("pending_action", {})
         supported = sum(claim["status"] == "supported" for claim in bundle["claims"])
         contested = sum(claim["status"] == "contested" for claim in bundle["claims"])
         positions = [
             {
-                "agent": "PI",
-                "recommendation": "continue" if bundle["claims"] else "revise",
-                "confidence": 0.65 if bundle["claims"] else 0.2,
-                "reason": "The charter is ready; the decision depends on evidence coverage.",
+                "agent": "Harness Controller",
+                "recommendation": "continue" if evaluation.ready_for_review else "revise",
+                "confidence": round(evaluation.coverage_score, 2),
+                "reason": evaluation.next_recommendation,
             },
             {
-                "agent": "Librarian",
-                "recommendation": "continue" if len(bundle["sources"]) >= 3 else "revise",
-                "confidence": min(0.9, len(bundle["sources"]) / 10),
-                "reason": (
-                    f"{len(bundle['sources'])} sources and "
-                    f"{len(bundle['claims'])} claims are bound."
-                ),
+                "agent": "Evidence Auditor",
+                "recommendation": "continue" if bundle["claims"] else "revise",
+                "confidence": min(0.95, len(bundle["sources"]) / 10),
+                "reason": f"{len(bundle['sources'])} sources, {len(bundle['claims'])} claims.",
             },
             {
                 "agent": "Skeptic",
-                "recommendation": "revise" if contested == 0 else "continue",
-                "confidence": 0.6,
-                "reason": f"{contested} claims have explicit opposing evidence.",
+                "recommendation": "continue"
+                if contested or evaluation.ready_for_review
+                else "revise",
+                "confidence": 0.65,
+                "reason": f"{contested} claims retain material counterevidence links.",
             },
             {
-                "agent": "Writer",
-                "recommendation": "continue" if supported + contested > 0 else "revise",
-                "confidence": 0.55,
-                "reason": "A memo can be drafted only from traceable evidence links.",
+                "agent": "Independent Reviewer",
+                "recommendation": "continue" if supported + contested else "revise",
+                "confidence": 0.6,
+                "reason": (
+                    "A draft will still face citation and evidence review before publication."
+                ),
             },
         ]
         packet = {
@@ -339,9 +331,10 @@ class ResearchWorkflow:
             "claim_count": len(bundle["claims"]),
             "supported_count": supported,
             "contested_count": contested,
-            "unresolved_questions": []
-            if bundle["claims"]
-            else ["No usable evidence was retrieved; add sources or revise the search."],
+            "coverage_score": evaluation.coverage_score,
+            "unresolved_questions": evaluation.gaps,
+            "trigger_action": action.get("action", "request_user"),
+            "trigger_reason": action.get("rationale", "Human review required."),
         }
         digest = hashlib.sha256(json.dumps(packet, sort_keys=True).encode()).hexdigest()
         result = await self.domain.execute(
@@ -352,11 +345,11 @@ class ResearchWorkflow:
                 ),
                 actor="pi",
                 run_id=state["run_id"],
-                trigger="Evidence review before synthesis",
+                trigger=packet["trigger_reason"],
                 agenda=[
-                    "Is the evidence coverage sufficient?",
-                    "Which claims remain contested?",
-                    "Continue, revise the search, or stop?",
+                    "Does the trace justify the next step?",
+                    "Which evidence gaps or dissent remain material?",
+                    "Continue to a reviewed draft, revise the investigation, or stop?",
                 ],
                 evidence_packet=packet,
                 position_cards=positions,
@@ -384,33 +377,42 @@ class ResearchWorkflow:
             }
         )
         kind = str(decision.get("kind", "stop"))
-        update: dict[str, Any] = {"meeting_id": result.entity_id, "decision": decision}
+        update: dict[str, Any] = {
+            "meeting_id": result.entity_id,
+            "decision": decision,
+            "current_phase": ResearchPhase.WRITER.value
+            if kind == "continue"
+            else ResearchPhase.DECIDE.value
+            if kind == "revise"
+            else ResearchPhase.COMPLETE.value,
+        }
         if kind == "revise":
-            update.update(
-                {
-                    "generation": generation + 1,
-                    "revision_direction": decision.get("direction"),
-                    "current_phase": ResearchPhase.LIBRARIAN.value,
-                }
+            update["generation"] = generation + 1
+            update["revision_direction"] = decision.get("direction")
+        await self.domain.record_harness_event(
+            project_id=state["project_id"],
+            run_id=state["run_id"],
+            event_type="HarnessHumanDecisionApplied",
+            payload={"meeting_id": result.entity_id, **decision},
+        )
+        if kind != "stop":
+            await self._persist_progress(
+                state,
+                update,
+                ResearchPhase.WRITER if kind == "continue" else ResearchPhase.DECIDE,
             )
-            await self._persist_progress(state, update, ResearchPhase.LIBRARIAN)
-        elif kind == "continue":
-            update["current_phase"] = ResearchPhase.WRITER.value
-            await self._persist_progress(state, update, ResearchPhase.WRITER)
-        else:
-            update["current_phase"] = ResearchPhase.COMPLETE.value
         return update
 
     @staticmethod
-    def _route_after_meeting(state: ResearchState) -> Literal["writer", "revise", "stop"]:
+    def _route_meeting(state: ResearchState) -> Literal["draft", "controller", "stop"]:
         kind = state.get("decision", {}).get("kind", "stop")
         if kind == "continue":
-            return "writer"
+            return "draft"
         if kind == "revise":
-            return "revise"
+            return "controller"
         return "stop"
 
-    async def _writer(self, state: ResearchState) -> dict:
+    async def _draft(self, state: ResearchState) -> dict:
         bundle = await self.domain.evidence_bundle(state["project_id"])
         if not bundle["sources"] or not bundle["claims"]:
             raise RuntimeError(
@@ -424,19 +426,21 @@ class ResearchWorkflow:
         try:
             body = await self.model.complete_text(
                 system=(
-                    "You are a cautious research synthesizer. Use only the supplied evidence. "
-                    "Every substantive claim must cite one or more supplied labels like [S1]. "
-                    "Preserve uncertainty and counterevidence. Never invent a citation label."
+                    "You are a cautious research synthesizer. Use only supplied evidence. Every "
+                    "substantive claim must cite supplied labels like [S1]. Preserve uncertainty, "
+                    "counterevidence, and unresolved questions. Never invent a citation label."
                 ),
                 prompt=json.dumps(
                     {
                         "question": state["question"],
-                        "charter": state.get("charter", {}),
+                        "plan": state.get("plan", {}),
                         "decision": state.get("decision", {}),
+                        "previous_review": state.get("review", {}),
                         "evidence": bundle,
                         "source_labels": source_labels,
                     },
                     ensure_ascii=False,
+                    default=str,
                 ),
                 fallback=fallback,
             )
@@ -444,6 +448,64 @@ class ResearchWorkflow:
         except ModelUnavailableError:
             memo = fallback
         memo = _append_sources_if_missing(memo, bundle["sources"], source_labels)
+        update = {"draft": memo, "current_phase": ResearchPhase.REVIEW.value}
+        await self.domain.record_harness_event(
+            project_id=state["project_id"],
+            run_id=state["run_id"],
+            event_type="HarnessDraftGenerated",
+            payload={"characters": len(memo), "source_labels": list(source_labels.values())},
+        )
+        await self._persist_progress(state, update, ResearchPhase.REVIEW)
+        return update
+
+    async def _reviewer(self, state: ResearchState) -> dict:
+        bundle = await self.domain.evidence_bundle(state["project_id"])
+        source_labels = {
+            source["id"]: f"S{index}" for index, source in enumerate(bundle["sources"], 1)
+        }
+        verdict, source = await self.controller.review_draft(
+            memo=state["draft"], bundle=bundle, source_labels=source_labels
+        )
+        usage = dict(state.get("usage", {}))
+        usage["review_attempts"] = int(usage.get("review_attempts", 0)) + 1
+        review = {**verdict.model_dump(), "review_source": source}
+        if verdict.decision == "revise" and usage["review_attempts"] >= 3:
+            review["decision"] = "request_user"
+            review["summary"] = "The draft failed review three times; human guidance is required."
+        phase = ResearchPhase.PUBLISH if review["decision"] == "accept" else ResearchPhase.REVIEW
+        update = {
+            "usage": usage,
+            "review": review,
+            "current_phase": phase.value,
+            "pending_action": {
+                "action": "request_user",
+                "rationale": review["summary"],
+                "expected_outcome": "Human guidance resolves repeated reviewer findings.",
+            }
+            if review["decision"] == "request_user"
+            else state.get("pending_action", {}),
+        }
+        await self.domain.record_harness_event(
+            project_id=state["project_id"],
+            run_id=state["run_id"],
+            event_type="HarnessDraftReviewed",
+            payload=review,
+        )
+        await self._persist_progress(state, update, phase)
+        return update
+
+    @staticmethod
+    def _route_review(state: ResearchState) -> Literal["publish", "draft", "meeting"]:
+        decision = state.get("review", {}).get("decision", "request_user")
+        if decision == "accept":
+            return "publish"
+        if decision == "revise":
+            return "draft"
+        return "meeting"
+
+    async def _publish(self, state: ResearchState) -> dict:
+        memo = state["draft"]
+        bundle = await self.domain.evidence_bundle(state["project_id"])
         digest = hashlib.sha256(memo.encode("utf-8")).hexdigest()
         directory = self.settings.oplab_artifact_root / state["project_id"] / state["run_id"]
         directory.mkdir(parents=True, exist_ok=True)
@@ -463,20 +525,26 @@ class ResearchWorkflow:
                 actor="writer",
                 run_id=state["run_id"],
                 kind="research_memo",
-                title="Research memo",
+                title="Reviewed research memo",
                 path=str(final_path.resolve()),
                 media_type="text/markdown",
                 content_hash=digest,
                 provenance={
                     "trace_id": state["trace_id"],
                     "thread_id": state["thread_id"],
-                    "source_ids": list(source_labels),
+                    "source_ids": [source["id"] for source in bundle["sources"]],
+                    "claim_ids": [claim["id"] for claim in bundle["claims"]],
                     "model": self.settings.openai_model if self.model.enabled else "deterministic",
+                    "review": state.get("review", {}),
+                    "harness_trajectory_entries": len(state.get("trajectory", [])),
                 },
             )
         )
+        plan = _mark_synthesis_done(state.get("plan", {}))
+        await self._sync_plan_tasks(plan)
         final_state = {
             **state,
+            "plan": plan,
             "report_artifact_id": artifact.entity_id,
             "current_phase": ResearchPhase.COMPLETE.value,
             "stop_reason": StopReason.SUCCESS.value,
@@ -489,55 +557,75 @@ class ResearchWorkflow:
             stop_reason=StopReason.SUCCESS,
             report_artifact_id=artifact.entity_id,
         )
+        await self.domain.record_harness_event(
+            project_id=state["project_id"],
+            run_id=state["run_id"],
+            event_type="HarnessRunCompleted",
+            payload={"artifact_id": artifact.entity_id, "content_hash": digest},
+        )
         return final_state
 
     async def _stop(self, state: ResearchState) -> dict:
         final_state = {
             **state,
             "current_phase": ResearchPhase.COMPLETE.value,
-            "stop_reason": StopReason.SUCCESS.value,
+            "stop_reason": StopReason.NO_PROGRESS.value,
         }
         await self.domain.set_run_state(
             state["run_id"],
             status=RunStatus.CANCELLED,
             phase=ResearchPhase.COMPLETE,
             state=_json_state(final_state),
-            stop_reason=StopReason.SUCCESS,
+            stop_reason=StopReason.NO_PROGRESS,
         )
         return final_state
 
     async def _persist_progress(
-        self, state: ResearchState, update: dict, phase: ResearchPhase
+        self, state: ResearchState, update: dict[str, Any], phase: ResearchPhase
     ) -> None:
-        merged = {**state, **update}
         await self.domain.set_run_state(
             state["run_id"],
             status=RunStatus.RUNNING,
             phase=phase,
-            state=_json_state(merged),
+            state=_json_state({**state, **update}),
         )
+
+    async def _set_objective_status(
+        self, state: ResearchState, objective_id: str | None, status: TaskStatus
+    ) -> None:
+        if not objective_id:
+            return
+        for objective in state.get("plan", {}).get("objectives", []):
+            if objective.get("id") == objective_id and objective.get("task_id"):
+                await self.domain.set_task_status(objective["task_id"], status)
+
+    async def _sync_plan_tasks(self, plan: dict[str, Any]) -> None:
+        mapping = {
+            "todo": TaskStatus.TODO,
+            "in_progress": TaskStatus.IN_PROGRESS,
+            "done": TaskStatus.DONE,
+            "blocked": TaskStatus.BLOCKED,
+        }
+        for objective in plan.get("objectives", []):
+            if objective.get("task_id"):
+                await self.domain.set_task_status(
+                    objective["task_id"], mapping.get(objective.get("status"), TaskStatus.TODO)
+                )
 
     @staticmethod
     def _deterministic_memo(
-        state: ResearchState, bundle: dict, source_labels: dict[str, str]
+        state: ResearchState, bundle: dict[str, Any], source_labels: dict[str, str]
     ) -> str:
         lines = [
             f"# Research memo: {state['question']}",
             "",
             "## Decision context",
             "",
-            str(
-                state.get("decision", {}).get("rationale")
-                or "The evidence review approved synthesis."
-            ),
+            str(state.get("decision", {}).get("rationale") or "Human review approved synthesis."),
             "",
             "## Evidence-backed findings",
             "",
         ]
-        if not bundle["claims"]:
-            lines.append(
-                "No evidence-backed claim is currently available. Further retrieval is required."
-            )
         for claim in bundle["claims"]:
             labels = sorted(
                 {
@@ -564,7 +652,7 @@ class ResearchWorkflow:
                 "- Source abstracts and uploaded passages support screening, "
                 "not automatic causal inference.",
                 "- Contested links identify material for human review; "
-                "they do not by themselves refute a claim.",
+                "they do not automatically refute a claim.",
                 "- Full-text access, study quality, and external validity "
                 "require follow-up review.",
             ]
@@ -629,86 +717,75 @@ class RunManager:
             )
 
 
-def _json_state(state: dict) -> dict:
-    return json.loads(json.dumps(state, default=str))
-
-
-def _normalize_charter(payload: Any, fallback: dict[str, Any]) -> dict[str, Any]:
-    """Keep provider formatting differences from breaking the research run."""
-    values = payload if isinstance(payload, dict) else {}
-    raw_queries = values.get("search_queries") or values.get("search_query")
-    fallback_queries = fallback.get("search_queries") or [fallback["search_query"]]
-    search_queries = [
-        query
-        for query in (
-            _normalize_search_query(item)
-            for item in _as_text_list(raw_queries, fallback_queries)
-        )
-        if query
-    ][:4]
-    if not search_queries:
-        search_queries = [_normalize_search_query(fallback["search_query"])]
+def _owner_for_kind(kind: str) -> str:
     return {
-        "research_question": _as_text(
-            values.get("research_question"), fallback["research_question"]
-        ),
-        "scope": _as_text(values.get("scope"), fallback["scope"]),
-        "success_criteria": _as_text_list(
-            values.get("success_criteria"), fallback["success_criteria"]
-        ),
-        "exclusions": _as_text_list(values.get("exclusions"), fallback["exclusions"]),
-        "evidence_requirements": _as_text_list(
-            values.get("evidence_requirements"), fallback["evidence_requirements"]
-        ),
-        "search_query": search_queries[0],
-        "search_queries": search_queries,
+        "discover": "Researcher",
+        "extract": "Evidence Analyst",
+        "challenge": "Skeptic",
+        "synthesize": "Reviewer",
+    }.get(kind, "Harness")
+
+
+def _update_plan_progress(
+    plan: dict[str, Any], state: ResearchState, evaluation: dict[str, Any]
+) -> dict[str, Any]:
+    value = json.loads(json.dumps(plan))
+    metrics = evaluation.get("metrics", {})
+    counter_searched = any(
+        item.get("action") == "search_literature" and item.get("intent") == "counter"
+        for item in state.get("trajectory", [])
+    )
+    counter_sources = {
+        sid for sid, intent in state.get("source_intents", {}).items() if intent == "counter"
     }
+    challenged = set(state.get("challenged_source_ids", []))
+    for objective in value.get("objectives", []):
+        kind = objective.get("kind")
+        if kind == "discover" and metrics.get("sources", 0) >= state.get("quality_gate", {}).get(
+            "min_sources", 3
+        ):
+            objective["status"] = "done"
+        elif kind == "extract" and metrics.get("claims", 0) >= state.get("quality_gate", {}).get(
+            "min_claims", 2
+        ):
+            objective["status"] = "done"
+        elif kind == "challenge" and counter_searched and counter_sources <= challenged:
+            objective["status"] = "done"
+        elif objective.get("status") == "todo":
+            objective["status"] = "in_progress"
+            break
+    return value
 
 
-def _as_text(value: Any, fallback: str) -> str:
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    if isinstance(value, list):
-        joined = " ".join(str(item).strip() for item in value if str(item).strip())
-        if joined:
-            return joined
-    return fallback
+def _mark_synthesis_done(plan: dict[str, Any]) -> dict[str, Any]:
+    value = json.loads(json.dumps(plan))
+    for objective in value.get("objectives", []):
+        if objective.get("kind") == "synthesize":
+            objective["status"] = "done"
+    return value
 
 
-def _as_text_list(value: Any, fallback: list[str]) -> list[str]:
-    if isinstance(value, str):
-        candidates = re.split(r"(?:\r?\n|[;；])", value)
-    elif isinstance(value, list):
-        candidates = value
-    else:
-        return list(fallback)
-    items = []
-    for candidate in candidates:
-        text = re.sub(r"^\s*(?:[-*•]|\d+[.)、])\s*", "", str(candidate)).strip()
-        if text:
-            items.append(text)
-    return items or list(fallback)
-
-
-def _normalize_search_query(value: str) -> str:
-    text = re.sub(r'["“”‘’()]', " ", value)
-    text = re.sub(r"\b(?:AND|OR|NOT)\b", " ", text, flags=re.IGNORECASE)
-    return re.sub(r"\s+", " ", text).strip()
+def _json_state(state: dict[str, Any]) -> dict[str, Any]:
+    return json.loads(json.dumps(state, default=str))
 
 
 def _citations_are_valid(text: str, allowed: set[str]) -> bool:
     labels = set(re.findall(r"\[(S\d+)\]", text))
-    return bool(labels) and labels.issubset(allowed)
+    return bool(labels) and labels <= allowed
 
 
-def _append_sources_if_missing(text: str, sources: list[dict], labels: dict[str, str]) -> str:
-    if "## Sources" in text:
-        return text.rstrip() + "\n"
-    lines = [text.rstrip(), "", "## Sources", ""]
+def _append_sources_if_missing(
+    memo: str, sources: list[dict[str, Any]], source_labels: dict[str, str]
+) -> str:
+    if "## Sources" in memo:
+        return memo.strip() + "\n"
+    lines = [memo.rstrip(), "", "## Sources", ""]
     for source in sources:
-        label = labels[source["id"]]
+        label = source_labels[source["id"]]
         details = ", ".join(source.get("authors") or [])
-        year = source.get("published_at") or "n.d."
-        prefix = f"{details} ({year}). " if details else f"({year}). "
-        lines.append(f"- [{label}] {prefix}{source['title']}. {source['uri']}")
+        if source.get("published_at"):
+            details = f"{details} ({source['published_at']})" if details else source["published_at"]
+        title = source["title"]
+        uri = source["uri"]
+        lines.append(f"- [{label}] {details}. [{title}]({uri}).".replace("  ", " "))
     return "\n".join(lines).strip() + "\n"
